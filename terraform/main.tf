@@ -441,27 +441,24 @@ resource "aws_iam_role_policy_attachment" "alb_controller_attachment" {
 # ---------------------------------------------------------------------------
 # Kubernetes + Helm providers
 #
-# IMPORTANT: these providers must be configured via data sources, NOT via
-# direct references to the aws_eks_cluster managed resource.
+# The token field must NOT be sourced from data.aws_eks_cluster_auth because
+# Terraform evaluates provider block configuration before data sources are
+# read. At provider-init time the data source attribute is an empty string,
+# causing the kubernetes provider to fall back to http://localhost:80 and
+# fail with "connection refused" on both apply and destroy.
 #
-# Terraform initialises provider configurations before the state-refresh
-# phase. If the kubernetes/helm provider blocks reference a managed resource
-# attribute (e.g. aws_eks_cluster.app-cluster.endpoint), that attribute is
-# an empty string at provider-init time (the resource hasn't been read from
-# state yet), so the kubernetes provider falls back to http://localhost:80
-# and fails with "connection refused" when trying to refresh or destroy any
-# kubernetes_* resource.
+# Instead we use an exec block that calls `aws eks get-token` lazily — the
+# AWS CLI is invoked only when the provider actually needs to open a
+# connection to the cluster, so the token is always fresh and the endpoint
+# is always reachable.
 #
-# data "aws_eks_cluster" / data "aws_eks_cluster_auth" make a live AWS API
-# call when evaluated, so the real endpoint is always returned for both
-# apply and destroy operations.
+# The host and cluster_ca_certificate are still sourced from
+# data.aws_eks_cluster because those values do not change between calls and
+# are safe to read during the refresh phase (they are not used by the
+# provider until it needs to make real API calls, which happen after the
+# data source has been evaluated).
 # ---------------------------------------------------------------------------
 data "aws_eks_cluster" "app_cluster_data" {
-  name       = "${var.project_name}-cluster"
-  depends_on = [aws_eks_cluster.app-cluster]
-}
-
-data "aws_eks_cluster_auth" "app_cluster_auth" {
   name       = "${var.project_name}-cluster"
   depends_on = [aws_eks_cluster.app-cluster]
 }
@@ -469,14 +466,34 @@ data "aws_eks_cluster_auth" "app_cluster_auth" {
 provider "kubernetes" {
   host                   = data.aws_eks_cluster.app_cluster_data.endpoint
   cluster_ca_certificate = base64decode(data.aws_eks_cluster.app_cluster_data.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.app_cluster_auth.token
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args = [
+      "eks",
+      "get-token",
+      "--cluster-name", "${var.project_name}-cluster",
+      "--region",       var.aws_region,
+    ]
+  }
 }
 
 provider "helm" {
   kubernetes {
     host                   = data.aws_eks_cluster.app_cluster_data.endpoint
     cluster_ca_certificate = base64decode(data.aws_eks_cluster.app_cluster_data.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.app_cluster_auth.token
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args = [
+        "eks",
+        "get-token",
+        "--cluster-name", "${var.project_name}-cluster",
+        "--region",       var.aws_region,
+      ]
+    }
   }
 }
 
@@ -591,32 +608,27 @@ resource "kubernetes_deployment" "app" {
 
           liveness_probe {
             http_get {
-              path = "/health/"
+              path = "/health"
               port = 8000
             }
             initial_delay_seconds = 30
             period_seconds        = 10
-            failure_threshold     = 3
           }
 
           readiness_probe {
             http_get {
-              path = "/health/"
+              path = "/health"
               port = 8000
             }
-            initial_delay_seconds = 15
+            initial_delay_seconds = 5
             period_seconds        = 5
-            failure_threshold     = 3
           }
         }
       }
     }
   }
 
-  depends_on = [
-    helm_release.aws_load_balancer_controller,
-    kubernetes_namespace.app,
-  ]
+  depends_on = [kubernetes_namespace.app]
 }
 
 # ---------------------------------------------------------------------------
@@ -626,9 +638,6 @@ resource "kubernetes_service" "app" {
   metadata {
     name      = "${var.project_name}-service"
     namespace = kubernetes_namespace.app.metadata[0].name
-    labels = {
-      app = var.project_name
-    }
   }
 
   spec {
@@ -644,7 +653,7 @@ resource "kubernetes_service" "app" {
     type = "ClusterIP"
   }
 
-  depends_on = [kubernetes_namespace.app]
+  depends_on = [kubernetes_deployment.app]
 }
 
 # ---------------------------------------------------------------------------
@@ -655,19 +664,22 @@ resource "kubernetes_ingress_v1" "app" {
     name      = "${var.project_name}-ingress"
     namespace = kubernetes_namespace.app.metadata[0].name
     annotations = {
-      "kubernetes.io/ingress.class"                = "alb"
-      "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type"      = "ip"
-      "alb.ingress.kubernetes.io/healthcheck-path" = "/health/"
+      "kubernetes.io/ingress.class"               = "alb"
+      "alb.ingress.kubernetes.io/scheme"          = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"     = "ip"
+      "alb.ingress.kubernetes.io/healthcheck-path" = "/health"
     }
   }
 
   spec {
+    ingress_class_name = "alb"
+
     rule {
       http {
         path {
           path      = "/"
           path_type = "Prefix"
+
           backend {
             service {
               name = kubernetes_service.app.metadata[0].name
