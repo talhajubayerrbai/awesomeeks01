@@ -46,7 +46,7 @@ variable "instance_type" {
 
 variable "cluster_version" {
   type    = string
-  default = "1.29"
+  default = "1.32"
 }
 
 variable "desired_node_count" {
@@ -605,9 +605,6 @@ resource "kubernetes_service" "app" {
   metadata {
     name      = "${var.project_name}-service"
     namespace = kubernetes_namespace.app.metadata[0].name
-    labels = {
-      app = var.project_name
-    }
   }
 
   spec {
@@ -618,7 +615,6 @@ resource "kubernetes_service" "app" {
     port {
       port        = 80
       target_port = 8000
-      protocol    = "TCP"
     }
 
     type = "ClusterIP"
@@ -635,15 +631,10 @@ resource "kubernetes_ingress_v1" "app" {
     name      = "${var.project_name}-ingress"
     namespace = kubernetes_namespace.app.metadata[0].name
     annotations = {
-      "kubernetes.io/ingress.class"                        = "alb"
-      "alb.ingress.kubernetes.io/scheme"                   = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type"              = "ip"
-      "alb.ingress.kubernetes.io/healthcheck-path"         = "/health/"
-      "alb.ingress.kubernetes.io/healthcheck-interval-seconds" = "30"
-      "alb.ingress.kubernetes.io/healthcheck-timeout-seconds"  = "5"
-      "alb.ingress.kubernetes.io/healthy-threshold-count"      = "2"
-      "alb.ingress.kubernetes.io/unhealthy-threshold-count"    = "3"
-      "alb.ingress.kubernetes.io/listen-ports"             = "[{\"HTTP\": 80}]"
+      "kubernetes.io/ingress.class"                = "alb"
+      "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"      = "ip"
+      "alb.ingress.kubernetes.io/healthcheck-path" = "/health/"
     }
   }
 
@@ -653,7 +644,6 @@ resource "kubernetes_ingress_v1" "app" {
         path {
           path      = "/"
           path_type = "Prefix"
-
           backend {
             service {
               name = kubernetes_service.app.metadata[0].name
@@ -688,12 +678,12 @@ output "eks_cluster_endpoint" {
   value = aws_eks_cluster.app-cluster.endpoint
 }
 
-output "alb_dns_name" {
+output "load_balancer_hostname" {
   value       = kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname
-  description = "ALB DNS name for the application"
+  description = "ALB hostname for public access"
 }
 
 output "app_url" {
   value       = "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}"
-  description = "Application URL"
+  description = "Public URL of the application via Load Balancer"
 }
