@@ -37,13 +37,16 @@ jobs:
   # ---------------------------------------------------------------------------
   # build - build Docker image and push to ECR
   # ---------------------------------------------------------------------------
-        continue-on-error: true
   build:
     name: Build & Push
     runs-on: ubuntu-latest
     needs: [test]
-    outputs:
-      image_uri: ${{ steps.push.outputs.image_uri }}
+    # NOTE: We intentionally do NOT expose image_uri as a job output here.
+    # GitHub Actions masks the AWS account ID (which appears in the ECR URI)
+    # as a secret and silently replaces the output value with an empty string,
+    # causing the downstream Terraform apply to receive image_uri="" and fail
+    # with "Required value" on the container image field.
+    # Instead, the Provision job reconstructs the URI itself from known parts.
 
     steps:
       - name: Checkout
@@ -89,7 +92,7 @@ jobs:
           IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "Pushed image: ${REPO}:${TAG}"
 
   # ---------------------------------------------------------------------------
   # provision - Terraform apply for all infrastructure + K8s resources
@@ -112,6 +115,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Reconstruct image URI
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO: ${{ secrets.PROJECT_NAME }}
+          TAG: ${{ github.sha }}
+        run: |
+          # Reconstruct the image URI locally within this job to avoid
+          # cross-job output secret-masking that would make it arrive empty.
+          IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -128,11 +147,13 @@ jobs:
 
       - name: Terraform Apply
         working-directory: terraform
+        env:
+          TF_VAR_image_uri: ${{ steps.image.outputs.image_uri }}
         run: |
           terraform apply -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="image_uri=${{ needs.build.outputs.image_uri }}"
+            -var="image_uri=${TF_VAR_image_uri}"
 
       - name: Capture Terraform outputs
         id: tf_output
