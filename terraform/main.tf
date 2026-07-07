@@ -457,12 +457,12 @@ resource "aws_iam_role_policy_attachment" "alb_controller_attachment" {
 # apply and destroy operations.
 # ---------------------------------------------------------------------------
 data "aws_eks_cluster" "app_cluster_data" {
-  name       = aws_eks_cluster.app-cluster.name
+  name       = "${var.project_name}-cluster"
   depends_on = [aws_eks_cluster.app-cluster]
 }
 
 data "aws_eks_cluster_auth" "app_cluster_auth" {
-  name       = aws_eks_cluster.app-cluster.name
+  name       = "${var.project_name}-cluster"
   depends_on = [aws_eks_cluster.app-cluster]
 }
 
