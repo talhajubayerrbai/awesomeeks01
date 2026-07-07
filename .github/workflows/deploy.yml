@@ -113,7 +113,7 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: "v1.29.0"
+          version: "v1.32.0"
 
       - name: Terraform Init
         working-directory: terraform
@@ -163,7 +163,7 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: "v1.29.0"
+          version: "v1.32.0"
 
       - name: Terraform Init
         working-directory: terraform
