@@ -1,4 +1,4 @@
-name: Destroy
+name: Destroy EKS Infrastructure
 
 on:
   workflow_dispatch:
@@ -25,6 +25,11 @@ jobs:
           terraform_version: "1.7.5"
           terraform_wrapper: false
 
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
       - name: Terraform Init
         working-directory: terraform
         run: |
@@ -32,6 +37,15 @@ jobs:
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Delete Kubernetes resources before destroy
+        run: |
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${{ secrets.PROJECT_NAME }}" || true
+          kubectl delete svc "${{ secrets.PROJECT_NAME }}-svc" -n default --ignore-not-found=true || true
+          kubectl delete deployment "${{ secrets.PROJECT_NAME }}" -n default --ignore-not-found=true || true
+          sleep 30
 
       - name: Terraform Destroy
         working-directory: terraform

@@ -1,12 +1,9 @@
-name: Deploy
+name: Deploy to EKS
 
 on:
   workflow_dispatch:
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # test - run the app's test suite
-  # ---------------------------------------------------------------------------
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -23,7 +20,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio httpx || true
+          pip install pytest pytest-asyncio httpx
 
       - name: Run tests
         run: |
@@ -34,19 +31,13 @@ jobs:
           pip install flake8 || true
           flake8 . --max-line-length=120 --extend-ignore=E501,W503 || true
 
-  # ---------------------------------------------------------------------------
-  # build - build Docker image and push to ECR
-  # ---------------------------------------------------------------------------
+        continue-on-error: true
   build:
-    name: Build & Push
+    name: Build & Push Image
     runs-on: ubuntu-latest
     needs: [test]
-    # NOTE: We intentionally do NOT expose image_uri as a job output here.
-    # GitHub Actions masks the AWS account ID (which appears in the ECR URI)
-    # as a secret and silently replaces the output value with an empty string,
-    # causing the downstream Terraform apply to receive image_uri="" and fail
-    # with "Required value" on the container image field.
-    # Instead, the Provision job reconstructs the URI itself from known parts.
+    outputs:
+      image_uri: ${{ steps.build_push.outputs.image_uri }}
 
     steps:
       - name: Checkout
@@ -59,7 +50,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -69,21 +60,22 @@ jobs:
           terraform_version: "1.7.5"
           terraform_wrapper: false
 
-      - name: Ensure ECR repository exists (terraform target)
+      - name: Create ECR repository (pre-push)
         working-directory: terraform
         run: |
           terraform init -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
           terraform apply -auto-approve \
-            -target=aws_ecr_repository.app_repo \
+            -target=aws_ecr_repository.app \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="image_uri=placeholder"
 
-      - name: Build, tag, and push Docker image
-        id: push
+      - name: Build, tag, and push image to ECR
+        id: build_push
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPO: ${{ secrets.PROJECT_NAME }}
@@ -92,17 +84,14 @@ jobs:
           IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
-          echo "Pushed image: ${REPO}:${TAG}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # provision - Terraform apply for all infrastructure + K8s resources
-  # ---------------------------------------------------------------------------
   provision:
-    name: Provision
+    name: Provision Infrastructure
     runs-on: ubuntu-latest
     needs: [build]
     outputs:
-      app_url: ${{ steps.tf_output.outputs.app_url }}
+      eks_cluster_name: ${{ steps.tf_outputs.outputs.eks_cluster_name }}
 
     steps:
       - name: Checkout
@@ -115,27 +104,16 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Reconstruct image URI
-        id: image
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          REPO: ${{ secrets.PROJECT_NAME }}
-          TAG: ${{ github.sha }}
-        run: |
-          # Reconstruct the image URI locally within this job to avoid
-          # cross-job output secret-masking that would make it arrive empty.
-          IMAGE_URI="${REGISTRY}/${REPO}:${TAG}"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.7.5"
           terraform_wrapper: false
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
 
       - name: Terraform Init
         working-directory: terraform
@@ -147,26 +125,21 @@ jobs:
 
       - name: Terraform Apply
         working-directory: terraform
-        env:
-          TF_VAR_image_uri: ${{ steps.image.outputs.image_uri }}
         run: |
           terraform apply -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="image_uri=${TF_VAR_image_uri}"
+            -var="image_uri=${{ needs.build.outputs.image_uri }}"
 
       - name: Capture Terraform outputs
-        id: tf_output
+        id: tf_outputs
         working-directory: terraform
         run: |
-          APP_URL=$(terraform output -raw app_url)
-          echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
+          EKS_CLUSTER=$(terraform output -raw eks_cluster_name)
+          echo "eks_cluster_name=${EKS_CLUSTER}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # verify - smoke test against the live ALB endpoint
-  # ---------------------------------------------------------------------------
   verify:
-    name: Verify
+    name: Verify Deployment
     runs-on: ubuntu-latest
     needs: [provision]
 
@@ -187,6 +160,11 @@ jobs:
           terraform_version: "1.7.5"
           terraform_wrapper: false
 
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
       - name: Terraform Init
         working-directory: terraform
         run: |
@@ -195,27 +173,38 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Get ALB endpoint from Terraform output
+      - name: Get app URL from Terraform output
         id: get_url
         working-directory: terraform
         run: |
           APP_URL=$(terraform output -raw app_url)
-          echo "APP_URL=${APP_URL}" >> "$GITHUB_ENV"
           echo "app_url=${APP_URL}" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for ALB to be ready
-        run: |-
-          echo "Waiting up to 10 minutes for ALB DNS to propagate and become healthy..."
-          for i in $(seq 1 60); do
+      - name: Wait for LoadBalancer to be ready
+        run: |
+          APP_URL="${{ steps.get_url.outputs.app_url }}"
+          echo "Waiting for LoadBalancer DNS to propagate: ${APP_URL}"
+          for i in $(seq 1 30); do
             STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" "${APP_URL}/health/" 2>/dev/null || echo "000")
-            echo "Attempt ${i}/60 - HTTP ${STATUS} - ${APP_URL}/health/"
+            echo "Attempt ${i}: HTTP ${STATUS}"
             if [[ "$STATUS" =~ ^[23] ]]; then
-              echo "ALB is healthy!"
+              echo "Health check passed with status ${STATUS}"
               exit 0
             fi
-            sleep 10
+            sleep 20
           done
-          echo "ERROR: ALB did not become healthy within 10 minutes"
-          echo "Final status check:"
-          curl -Lv "${APP_URL}/health/" || true
+          echo "ERROR: App did not become healthy within the timeout."
           exit 1
+
+      - name: Smoke test
+        run: |-
+          APP_URL="${{ steps.get_url.outputs.app_url }}"
+          echo "Running smoke test against ${APP_URL}"
+          STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" "${APP_URL}/health/" 2>/dev/null)
+          echo "Final status: ${STATUS}"
+          if [[ "$STATUS" =~ ^[23] ]]; then
+            echo "Smoke test PASSED"
+          else
+            echo "Smoke test FAILED with HTTP ${STATUS}"
+            exit 1
+          fi
