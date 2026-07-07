@@ -605,6 +605,9 @@ resource "kubernetes_service" "app" {
   metadata {
     name      = "${var.project_name}-service"
     namespace = kubernetes_namespace.app.metadata[0].name
+    labels = {
+      app = var.project_name
+    }
   }
 
   spec {
@@ -615,6 +618,7 @@ resource "kubernetes_service" "app" {
     port {
       port        = 80
       target_port = 8000
+      protocol    = "TCP"
     }
 
     type = "ClusterIP"
@@ -624,7 +628,7 @@ resource "kubernetes_service" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# Kubernetes Ingress (ALB)
+# Kubernetes Ingress
 # ---------------------------------------------------------------------------
 resource "kubernetes_ingress_v1" "app" {
   metadata {
@@ -638,12 +642,18 @@ resource "kubernetes_ingress_v1" "app" {
     }
   }
 
+  # Block until the AWS Load Balancer Controller has provisioned the ALB
+  # and written its hostname into the Ingress status. Without this flag
+  # Terraform proceeds immediately and the ingress[0] index below is empty.
+  wait_for_load_balancer = true
+
   spec {
     rule {
       http {
         path {
           path      = "/"
           path_type = "Prefix"
+
           backend {
             service {
               name = kubernetes_service.app.metadata[0].name
@@ -666,24 +676,12 @@ resource "kubernetes_ingress_v1" "app" {
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
-output "ecr_repository_url" {
-  value = aws_ecr_repository.app_repo.repository_url
-}
-
-output "eks_cluster_name" {
-  value = aws_eks_cluster.app-cluster.name
-}
-
-output "eks_cluster_endpoint" {
-  value = aws_eks_cluster.app-cluster.endpoint
-}
-
 output "load_balancer_hostname" {
-  value       = kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname
   description = "ALB hostname for public access"
+  value       = try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")
 }
 
 output "app_url" {
-  value       = "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}"
   description = "Public URL of the application via Load Balancer"
+  value       = "http://${try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")}"
 }
