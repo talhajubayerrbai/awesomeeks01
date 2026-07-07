@@ -439,22 +439,43 @@ resource "aws_iam_role_policy_attachment" "alb_controller_attachment" {
 }
 
 # ---------------------------------------------------------------------------
-# Kubernetes + Helm providers (configured after cluster exists)
+# Kubernetes + Helm providers
+#
+# IMPORTANT: these providers must be configured via data sources, NOT via
+# direct references to the aws_eks_cluster managed resource.
+#
+# Terraform initialises provider configurations before the state-refresh
+# phase. If the kubernetes/helm provider blocks reference a managed resource
+# attribute (e.g. aws_eks_cluster.app-cluster.endpoint), that attribute is
+# an empty string at provider-init time (the resource hasn't been read from
+# state yet), so the kubernetes provider falls back to http://localhost:80
+# and fails with "connection refused" when trying to refresh or destroy any
+# kubernetes_* resource.
+#
+# data "aws_eks_cluster" / data "aws_eks_cluster_auth" make a live AWS API
+# call when evaluated, so the real endpoint is always returned for both
+# apply and destroy operations.
 # ---------------------------------------------------------------------------
+data "aws_eks_cluster" "app_cluster_data" {
+  name       = aws_eks_cluster.app-cluster.name
+  depends_on = [aws_eks_cluster.app-cluster]
+}
+
 data "aws_eks_cluster_auth" "app_cluster_auth" {
-  name = aws_eks_cluster.app-cluster.name
+  name       = aws_eks_cluster.app-cluster.name
+  depends_on = [aws_eks_cluster.app-cluster]
 }
 
 provider "kubernetes" {
-  host                   = aws_eks_cluster.app-cluster.endpoint
-  cluster_ca_certificate = base64decode(aws_eks_cluster.app-cluster.certificate_authority[0].data)
+  host                   = data.aws_eks_cluster.app_cluster_data.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.app_cluster_data.certificate_authority[0].data)
   token                  = data.aws_eks_cluster_auth.app_cluster_auth.token
 }
 
 provider "helm" {
   kubernetes {
-    host                   = aws_eks_cluster.app-cluster.endpoint
-    cluster_ca_certificate = base64decode(aws_eks_cluster.app-cluster.certificate_authority[0].data)
+    host                   = data.aws_eks_cluster.app_cluster_data.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.app_cluster_data.certificate_authority[0].data)
     token                  = data.aws_eks_cluster_auth.app_cluster_auth.token
   }
 }
@@ -618,13 +639,12 @@ resource "kubernetes_service" "app" {
     port {
       port        = 80
       target_port = 8000
-      protocol    = "TCP"
     }
 
     type = "ClusterIP"
   }
 
-  depends_on = [kubernetes_deployment.app]
+  depends_on = [kubernetes_namespace.app]
 }
 
 # ---------------------------------------------------------------------------
@@ -642,18 +662,12 @@ resource "kubernetes_ingress_v1" "app" {
     }
   }
 
-  # Block until the AWS Load Balancer Controller has provisioned the ALB
-  # and written its hostname into the Ingress status. Without this flag
-  # Terraform proceeds immediately and the ingress[0] index below is empty.
-  wait_for_load_balancer = true
-
   spec {
     rule {
       http {
         path {
           path      = "/"
           path_type = "Prefix"
-
           backend {
             service {
               name = kubernetes_service.app.metadata[0].name
@@ -676,12 +690,18 @@ resource "kubernetes_ingress_v1" "app" {
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
-output "load_balancer_hostname" {
-  description = "ALB hostname for public access"
-  value       = try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")
+output "ecr_repository_url" {
+  value = aws_ecr_repository.app_repo.repository_url
+}
+
+output "eks_cluster_name" {
+  value = aws_eks_cluster.app-cluster.name
+}
+
+output "alb_hostname" {
+  value = try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")
 }
 
 output "app_url" {
-  description = "Public URL of the application via Load Balancer"
-  value       = "http://${try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")}"
+  value = "http://${try(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname, "")}"
 }
