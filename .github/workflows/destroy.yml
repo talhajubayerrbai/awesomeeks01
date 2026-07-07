@@ -33,7 +33,7 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Delete Kubernetes Ingress to drain ALB before destroy
+      - name: Delete Kubernetes Ingress and wait for ALB deprovisioning
         run: |
           # Install kubectl
           curl -sSL "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
@@ -61,25 +61,58 @@ jobs:
             echo "Ingress ${INGRESS_NAME} not found in namespace ${NAMESPACE} — already deleted or cluster is gone."
           fi
 
-          # Wait up to 5 minutes for the ALB to be fully deprovisioned
-          # (i.e. for the AWS Load Balancer Controller to remove the ALB ENIs
-          # from the public subnets so terraform destroy can delete them).
-          echo "Waiting for ALB to be fully deprovisioned (up to 5 minutes)..."
-          for i in $(seq 1 30); do
-            # The ALB is gone when the load-balancer hostname disappears from
-            # the ingress status OR when the ingress itself no longer exists.
-            HOSTNAME=$(kubectl get ingress "${INGRESS_NAME}" \
-              -n "${NAMESPACE}" \
-              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-            if [ -z "${HOSTNAME}" ]; then
-              echo "ALB hostname cleared — ALB is deprovisioned."
+          # Now wait for the actual AWS ALB to be fully deprovisioned using the
+          # AWS CLI. We cannot rely on the Kubernetes Ingress object's hostname
+          # field here because the Ingress object is already deleted above, so
+          # kubectl get ingress immediately returns an error and the hostname is
+          # always empty — causing a false-positive "ALB is gone" result.
+          #
+          # Instead we query ELBv2 directly for any load balancers whose tags
+          # identify them as belonging to this cluster. The AWS Load Balancer
+          # Controller tags every ALB it creates with the Kubernetes service/
+          # ingress ownership tags, including the cluster name tag. We poll
+          # until no matching ALBs remain (or for up to 10 minutes).
+          echo "Waiting for the AWS ALB to be fully deprovisioned (up to 10 minutes)..."
+          for i in $(seq 1 60); do
+            # List all ALBs whose tag elbv2.k8s.aws/cluster matches the EKS
+            # cluster name. The AWS LBC always sets this tag on ALBs it manages.
+            ALB_ARNS=$(
+              aws elbv2 describe-load-balancers \
+                --region "${{ secrets.AWS_REGION }}" \
+                --query 'LoadBalancers[*].LoadBalancerArn' \
+                --output text 2>/dev/null || echo ""
+            )
+
+            if [ -z "${ALB_ARNS}" ]; then
+              echo "No load balancers found at all — ALB is deprovisioned."
               break
             fi
-            echo "Attempt ${i}/30: ALB hostname still present (${HOSTNAME}), waiting 10s..."
+
+            # Filter by the cluster tag
+            CLUSTER_ALB_COUNT=0
+            for ARN in ${ALB_ARNS}; do
+              TAGS=$(
+                aws elbv2 describe-tags \
+                  --region "${{ secrets.AWS_REGION }}" \
+                  --resource-arns "${ARN}" \
+                  --query 'TagDescriptions[0].Tags' \
+                  --output text 2>/dev/null || echo ""
+              )
+              if echo "${TAGS}" | grep -q "${CLUSTER_NAME}"; then
+                CLUSTER_ALB_COUNT=$((CLUSTER_ALB_COUNT + 1))
+              fi
+            done
+
+            if [ "${CLUSTER_ALB_COUNT}" -eq 0 ]; then
+              echo "All ALBs for cluster ${CLUSTER_NAME} have been deprovisioned."
+              break
+            fi
+
+            echo "Attempt ${i}/60: ${CLUSTER_ALB_COUNT} ALB(s) for cluster ${CLUSTER_NAME} still exist, waiting 10s..."
             sleep 10
           done
 
-          echo "Ingress cleanup complete."
+          echo "ALB cleanup complete."
 
       - name: Terraform Destroy
         working-directory: terraform
