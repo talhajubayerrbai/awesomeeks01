@@ -33,6 +33,54 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
+      - name: Delete Kubernetes Ingress to drain ALB before destroy
+        run: |
+          # Install kubectl
+          curl -sSL "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+            -o /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+
+          # Configure kubeconfig for the EKS cluster
+          CLUSTER_NAME="${{ secrets.PROJECT_NAME }}-cluster"
+          aws eks update-kubeconfig \
+            --region "${{ secrets.AWS_REGION }}" \
+            --name "${CLUSTER_NAME}" || {
+            echo "Could not reach EKS cluster (may already be gone). Skipping Ingress cleanup."
+            exit 0
+          }
+
+          NAMESPACE="${{ secrets.PROJECT_NAME }}"
+          INGRESS_NAME="${{ secrets.PROJECT_NAME }}-ingress"
+
+          # Delete the Ingress so the ALB controller deprovisions the ALB
+          # and releases all ENIs from the public subnets.
+          if kubectl get ingress "${INGRESS_NAME}" -n "${NAMESPACE}" &>/dev/null; then
+            echo "Deleting Ingress ${INGRESS_NAME} in namespace ${NAMESPACE}..."
+            kubectl delete ingress "${INGRESS_NAME}" -n "${NAMESPACE}" --timeout=60s || true
+          else
+            echo "Ingress ${INGRESS_NAME} not found in namespace ${NAMESPACE} — already deleted or cluster is gone."
+          fi
+
+          # Wait up to 5 minutes for the ALB to be fully deprovisioned
+          # (i.e. for the AWS Load Balancer Controller to remove the ALB ENIs
+          # from the public subnets so terraform destroy can delete them).
+          echo "Waiting for ALB to be fully deprovisioned (up to 5 minutes)..."
+          for i in $(seq 1 30); do
+            # The ALB is gone when the load-balancer hostname disappears from
+            # the ingress status OR when the ingress itself no longer exists.
+            HOSTNAME=$(kubectl get ingress "${INGRESS_NAME}" \
+              -n "${NAMESPACE}" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -z "${HOSTNAME}" ]; then
+              echo "ALB hostname cleared — ALB is deprovisioned."
+              break
+            fi
+            echo "Attempt ${i}/30: ALB hostname still present (${HOSTNAME}), waiting 10s..."
+            sleep 10
+          done
+
+          echo "Ingress cleanup complete."
+
       - name: Terraform Destroy
         working-directory: terraform
         run: |-
